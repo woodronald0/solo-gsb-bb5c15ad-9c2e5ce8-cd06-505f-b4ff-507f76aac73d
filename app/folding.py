@@ -252,19 +252,25 @@ def plan_punches(
     1. 目标孔位去重并做板材边界校验；
     2. 沿折叠序列把每个目标孔位正向归并到最终折叠面的等价位置，
        相同位置构成一个等价组，组代表即候选打孔点；
-    3. 复用 unfold_board 对候选打孔点复算展开结果；
-    4. 仅当每个等价组都形成完整镜像轨道（复算集合与目标集合完全一致）
-       时，返回按 (x, y) 稳定排序的最小打孔点列表。
+    3. 复用 unfold_board 贯穿复算，把组内每个目标映射为其在最终叠层中
+       自上而下的层号；
+    4. 仅当组内层号恰为连续前缀 1..d 时，该组可由一个限深 depth=d 的
+       打孔点实现（d 等于总层数 2^len(folds) 时贯穿全部层，省略 depth）；
+       跳层或缺少更上层时拒绝并指出缺失的前缀层，绝不默默补孔；
+    5. 用推断出的限深打孔点再次复算，确认孔位集合与去重后的目标集合
+       完全一致后，返回按 (x, y) 稳定排序的最小打孔点列表。
 
     异常：
         FoldError("target_out_of_bounds")：目标含越界坐标，
             context 的 out_of_bounds 列出全部越界点。
-        FoldError("incomplete_equivalence_group")：首个不完整等价组，
-            context 列出该组缺失 / 多余坐标，绝不默默补孔。
+        FoldError("non_prefix_depth_group")：首个（按 (x, y) 排序）无法由
+            连续前缀层实现的等价组，context 列出 group、present_layers、
+            missing_prefix_layers。
         FoldError("limit_exceeded")：归并后的打孔点数或展开孔位总数超限。
     """
     regions = fold_regions(width, height, folds)
     final = regions[-1]
+    total_layers = 1 << len(folds)
 
     # 目标孔位去重，统一按 (x, y) 排序保证后续处理顺序稳定
     unique_targets = sorted(set(targets))
@@ -307,34 +313,44 @@ def plan_punches(
                 f"MAX_TOTAL_HOLES={max_total_holes}，请减少折叠步数或目标孔位。",
             )
 
-    # 用现有展开逻辑复算，并把复算孔位归并回各自等价组（即完整镜像轨道）
-    recomputed = unfold_board(width, height, folds, punches)
-    orbit_by_punch: dict[tuple[int, int], set[tuple[int, int]]] = {
-        punch: set() for punch in punches
+    # 贯穿复算，得到每个坐标在所属等价组叠层中的层号（自上而下 1..total_layers）。
+    # 不同候选打孔点的镜像轨道互不相交，故坐标 -> 层号即可唯一定位。
+    full = unfold_board(width, height, folds, punches)
+    layer_by_coord: dict[tuple[int, int], int] = {
+        (hole["x"], hole["y"]): hole["paths"][0]["layer"] for hole in full["holes"]
     }
-    for hole in recomputed["holes"]:
-        orbit_by_punch[to_local(hole["x"], hole["y"])].add((hole["x"], hole["y"]))
 
-    # 按 (x, y) 顺序找到首个不完整等价组，列出缺失 / 多余坐标
+    # 逐组（按 (x, y) 稳定排序）校验层号是否构成连续前缀并推断限深
+    depths_by_punch: dict[tuple[int, int], int] = {}
     for punch in punches:
-        orbit = orbit_by_punch[punch]
-        members = members_by_punch[punch]
-        missing = sorted(orbit - members)  # 轨道中未被目标覆盖的对称孔
-        extra = sorted(members - orbit)    # 目标中不属于该轨道的孔（结构性为空，防御保留）
-        if missing or extra:
+        present = sorted({layer_by_coord[coord] for coord in members_by_punch[punch]})
+        depth = len(present)
+        if present != list(range(1, depth + 1)):
+            present_set = set(present)
+            missing = [
+                layer
+                for layer in range(1, present[-1] + 1)
+                if layer not in present_set
+            ]
             raise FoldError(
-                "incomplete_equivalence_group",
-                f"等价组 ({punch[0]}, {punch[1]}) 的镜像轨道不完整："
-                f"缺失 {len(missing)} 个、多余 {len(extra)} 个坐标；"
-                "请补全或移除后重试，服务端不会自动补孔。",
+                "non_prefix_depth_group",
+                f"等价组 ({punch[0]}, {punch[1]}) 的目标层号 {present} 不是自"
+                f"上而下的连续前缀 1..d（缺失前缀层 {missing}），无法由单个限"
+                "深打孔点实现；请补全更上层或移除跳层目标后重试，"
+                "服务端不会自动补孔。",
                 group={"x": punch[0], "y": punch[1]},
-                missing=[{"x": x, "y": y} for x, y in missing],
-                extra=[{"x": x, "y": y} for x, y in extra],
+                present_layers=present,
+                missing_prefix_layers=missing,
             )
+        depths_by_punch[punch] = depth
 
-    # 组完整性已保证复算集合与目标集合一致，此处为防御性校验
-    target_set = set(unique_targets)
+    # 用推断出的限深打孔点复算，确认孔位与去重后的目标集合完全一致（防御性校验）
+    inferred_depths = [depths_by_punch[punch] for punch in punches]
+    recomputed = unfold_board(
+        width, height, folds, punches, depths=inferred_depths
+    )
     recomputed_set = {(h["x"], h["y"]) for h in recomputed["holes"]}
+    target_set = set(unique_targets)
     if recomputed_set != target_set:
         raise FoldError(
             "target_mismatch",
@@ -343,6 +359,14 @@ def plan_punches(
             extra=[{"x": x, "y": y} for x, y in sorted(recomputed_set - target_set)],
         )
 
+    # depth 等于总层数时贯穿全部层，省略 depth
+    planned: list[dict] = []
+    for x, y in punches:
+        point = {"x": x, "y": y}
+        depth = depths_by_punch[(x, y)]
+        if depth < total_layers:
+            point["depth"] = depth
+        planned.append(point)
     return {
         "final_face": {
             "x": final.x,
@@ -350,8 +374,8 @@ def plan_punches(
             "width": final.width,
             "height": final.height,
         },
-        "stack_layers": 1 << len(folds),
+        "stack_layers": total_layers,
         "target_count": len(unique_targets),
         "punch_count": len(punches),
-        "punches": [{"x": x, "y": y} for x, y in punches],
+        "punches": planned,
     }

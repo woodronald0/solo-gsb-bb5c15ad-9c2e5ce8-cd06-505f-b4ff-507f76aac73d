@@ -172,8 +172,11 @@ class PunchPlanResponse(BaseModel):
     stack_layers: int = Field(..., description="折叠后每处的纸层数 = 2^len(folds)")
     target_count: int = Field(..., description="去重后的目标孔位数")
     punch_count: int = Field(..., description="最小打孔点数（等价组数）")
-    punches: List[PunchPoint] = Field(
-        ..., description="最终折叠面上的打孔点（局部坐标），按 (x, y) 稳定排序"
+    punches: List[DepthPunchPoint] = Field(
+        ...,
+        description="最终折叠面上的打孔点（局部坐标），按 (x, y) 稳定排序；"
+        "depth 等于 stack_layers（贯穿全部层）时省略，可直接作为 "
+        "/api/v1/unfold 的 punches 使用",
     )
 
 

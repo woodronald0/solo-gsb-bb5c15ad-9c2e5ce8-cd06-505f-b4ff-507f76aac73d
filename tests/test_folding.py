@@ -263,32 +263,101 @@ def test_plan_punches_target_out_of_bounds():
     assert err.context["board_height"] == 4
 
 
-def test_plan_punches_incomplete_group_reports_missing():
-    with pytest.raises(FoldError) as exc_info:
-        plan_punches(8, 4, ["left", "down"], [(1, 1)])
-    err = exc_info.value
-    assert err.code == "incomplete_equivalence_group"
-    assert err.context["group"] == {"x": 1, "y": 0}
-    assert err.context["missing"] == [
-        {"x": 1, "y": 2},
-        {"x": 6, "y": 1},
-        {"x": 6, "y": 2},
+def test_plan_punches_depth_one_for_single_top_layer_target():
+    # 仅给出组 (1, 0) 的最上层 (1,1)（层号 1）-> depth=1 的限深打孔点
+    res = plan_punches(8, 4, ["left", "down"], [(1, 1)])
+    assert res["target_count"] == 1
+    assert res["punch_count"] == 1
+    assert res["punches"] == [{"x": 1, "y": 0, "depth": 1}]
+
+
+def test_plan_punches_infers_depth_from_prefix_layers():
+    # (1,1) 层号 1、(6,1) 层号 2，构成连续前缀 1..2 -> depth=2
+    res = plan_punches(8, 4, ["left", "down"], [(6, 1), (1, 1)])
+    assert res["punches"] == [{"x": 1, "y": 0, "depth": 2}]
+    # 推断结果交给 unfold 复算，孔位与去重后的目标完全一致
+    unfolded = unfold_board(8, 4, ["left", "down"], [(1, 0)], [2])
+    assert {(h["x"], h["y"]) for h in unfolded["holes"]} == {(1, 1), (6, 1)}
+
+
+def test_plan_punches_full_stack_omits_depth():
+    # 完整镜像轨道（层 1..4）-> 贯穿全部层，省略 depth
+    res = plan_punches(8, 4, ["left", "down"], [(1, 1), (1, 2), (6, 1), (6, 2)])
+    assert res["punches"] == [{"x": 1, "y": 0}]
+    assert "depth" not in res["punches"][0]
+
+
+def test_plan_punches_no_folds_depth_one_omitted():
+    res = plan_punches(3, 3, [], [(2, 1)])
+    assert res["stack_layers"] == 1
+    assert res["punches"] == [{"x": 2, "y": 1}]
+    assert "depth" not in res["punches"][0]
+
+
+def test_plan_punches_mixed_depth_groups_stable_sorted():
+    # 组 (0, 0)：仅 (0,1) 层号 1 -> depth=1
+    # 组 (1, 0)：(1,1) 层号 1、(6,1) 层号 2 -> depth=2
+    targets = [(6, 1), (1, 1), (0, 1)]
+    res = plan_punches(8, 4, ["left", "down"], targets)
+    assert res["punch_count"] == 2
+    assert res["punches"] == [
+        {"x": 0, "y": 0, "depth": 1},
+        {"x": 1, "y": 0, "depth": 2},
     ]
-    assert err.context["extra"] == []
+    # 复算孔位与去重后的目标完全一致
+    unfolded = unfold_board(
+        8, 4, ["left", "down"], [(0, 0), (1, 0)], depths=[1, 2]
+    )
+    assert {(h["x"], h["y"]) for h in unfolded["holes"]} == set(targets)
 
 
-def test_plan_punches_reports_first_incomplete_group_sorted():
-    # (6, 1) 归并到组 (1, 0)，(0, 3) 归并到组 (0, 1)；两组都不完整时报告 (x, y) 最小者
+def test_plan_punches_repeated_targets_deduped_with_depth():
+    res = plan_punches(8, 4, ["left", "down"], [(1, 1), (6, 1), (1, 1)])
+    assert res["target_count"] == 2
+    assert res["punches"] == [{"x": 1, "y": 0, "depth": 2}]
+
+
+def test_plan_punches_depth_result_feeds_unfold_board():
+    targets = [(1, 1), (6, 1)]
+    res = plan_punches(8, 4, ["left", "down"], targets)
+    punches = [(p["x"], p["y"]) for p in res["punches"]]
+    depths = [p.get("depth") for p in res["punches"]]
+    unfolded = unfold_board(8, 4, ["left", "down"], punches, depths)
+    assert {(h["x"], h["y"]) for h in unfolded["holes"]} == set(targets)
+
+
+def test_plan_punches_non_prefix_skips_layer_reports_present_and_missing():
+    # (6,1) 在组 (1,0) 中层号为 2：跳过了层 1
+    with pytest.raises(FoldError) as exc_info:
+        plan_punches(8, 4, ["left", "down"], [(6, 1)])
+    err = exc_info.value
+    assert err.code == "non_prefix_depth_group"
+    assert err.context["group"] == {"x": 1, "y": 0}
+    assert err.context["present_layers"] == [2]
+    assert err.context["missing_prefix_layers"] == [1]
+
+
+def test_plan_punches_non_prefix_reports_first_group_sorted():
+    # (6,1) 归并到组 (1,0)（层 2），(0,3) 归并到组 (0,1)（层 4，缺 1、2、3）；
+    # 两组都不是连续前缀时，报告 (x, y) 最小的组 (0,1)
     with pytest.raises(FoldError) as exc_info:
         plan_punches(8, 4, ["left", "down"], [(6, 1), (0, 3)])
     err = exc_info.value
-    assert err.code == "incomplete_equivalence_group"
+    assert err.code == "non_prefix_depth_group"
     assert err.context["group"] == {"x": 0, "y": 1}
-    assert err.context["missing"] == [
-        {"x": 0, "y": 0},
-        {"x": 7, "y": 0},
-        {"x": 7, "y": 3},
-    ]
+    assert err.context["present_layers"] == [4]
+    assert err.context["missing_prefix_layers"] == [1, 2, 3]
+
+
+def test_plan_punches_non_prefix_gap_in_middle():
+    # 给出层 1 和层 3、缺少层 2：present=[1,3]，missing_prefix=[2]
+    with pytest.raises(FoldError) as exc_info:
+        plan_punches(8, 4, ["left", "down"], [(1, 1), (6, 2)])
+    err = exc_info.value
+    assert err.code == "non_prefix_depth_group"
+    assert err.context["group"] == {"x": 1, "y": 0}
+    assert err.context["present_layers"] == [1, 3]
+    assert err.context["missing_prefix_layers"] == [2]
 
 
 def test_plan_punches_odd_axis_propagates():

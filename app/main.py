@@ -22,11 +22,12 @@ MAX_TOTAL_HOLES = int(os.environ.get("MAX_TOTAL_HOLES", "200000"))
 
 app = FastAPI(
     title="包装板材折叠打孔模板展开 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交整数网格矩形板材、依次执行的对折方向序列以及最终折叠面上的打孔点，"
         "服务端逆序展开折叠并镜像传播孔位，返回展开后的唯一孔位、覆盖层数与来源路径。"
-        "另提供反向打孔规划：由期望的展开孔位反推最终折叠面上的最小打孔点集合。"
+        "另提供反向打孔规划：由期望的展开孔位反推最终折叠面上的最小打孔点集合，"
+        "目标只覆盖连续前缀层时自动推断为限深打孔（depth）。"
     ),
 )
 
@@ -93,6 +94,7 @@ def unfold(req: UnfoldRequest) -> dict:
 @app.post(
     "/api/v1/punch-plan",
     response_model=PunchPlanResponse,
+    response_model_exclude_none=True,
     responses={400: {"model": ErrorResponse, "description": "领域校验失败"}},
 )
 def punch_plan(req: PunchPlanRequest) -> dict:

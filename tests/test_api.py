@@ -286,25 +286,152 @@ def test_punch_plan_target_out_of_bounds_returns_400():
     assert detail["out_of_bounds"] == [{"x": 4, "y": 0}]
 
 
-def test_punch_plan_incomplete_group_returns_400():
+def test_punch_plan_infers_depth_for_prefix_layers():
     resp = client.post(
         "/api/v1/punch-plan",
         json={
             "board": {"width": 8, "height": 4},
             "folds": ["left", "down"],
-            "targets": [{"x": 1, "y": 1}],
+            "targets": [
+                {"x": 1, "y": 1},  # 层号 1
+                {"x": 6, "y": 1},  # 层号 2
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target_count"] == 2
+    assert body["punch_count"] == 1
+    assert body["punches"] == [{"x": 1, "y": 0, "depth": 2}]
+
+
+def test_punch_plan_depth_one():
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [{"x": 1, "y": 1}],  # 仅最上层
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["punches"] == [{"x": 1, "y": 0, "depth": 1}]
+
+
+def test_punch_plan_full_stack_omits_depth():
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [
+                {"x": 1, "y": 1},
+                {"x": 1, "y": 2},
+                {"x": 6, "y": 1},
+                {"x": 6, "y": 2},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    punches = resp.json()["punches"]
+    assert punches == [{"x": 1, "y": 0}]
+    assert "depth" not in punches[0]
+
+
+def test_punch_plan_mixed_depth_groups_sorted():
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            # 组 (0,0) 仅最上层；组 (1,0) 前两层
+            "targets": [{"x": 6, "y": 1}, {"x": 1, "y": 1}, {"x": 0, "y": 1}],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["punches"] == [
+        {"x": 0, "y": 0, "depth": 1},
+        {"x": 1, "y": 0, "depth": 2},
+    ]
+
+
+def test_punch_plan_depth_result_compatible_with_unfold():
+    plan_resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [{"x": 1, "y": 1}, {"x": 6, "y": 1}],
+        },
+    )
+    assert plan_resp.status_code == 200
+    plan = plan_resp.json()
+    # 返回结果可直接作为 unfold 的 punches
+    resp = client.post(
+        "/api/v1/unfold",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "punches": plan["punches"],
+        },
+    )
+    assert resp.status_code == 200
+    coords = {(h["x"], h["y"]) for h in resp.json()["holes"]}
+    assert coords == {(1, 1), (6, 1)}
+
+
+def test_punch_plan_repeated_targets_deduped_with_depth():
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [
+                {"x": 6, "y": 1},
+                {"x": 1, "y": 1},
+                {"x": 6, "y": 1},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target_count"] == 2
+    assert body["punches"] == [{"x": 1, "y": 0, "depth": 2}]
+
+
+def test_punch_plan_non_prefix_depth_returns_400():
+    # (6,1) 在组 (1,0) 中层号为 2，缺少更上层 1
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [{"x": 6, "y": 1}],
         },
     )
     assert resp.status_code == 400
     detail = resp.json()["detail"]
-    assert detail["error"] == "incomplete_equivalence_group"
+    assert detail["error"] == "non_prefix_depth_group"
     assert detail["group"] == {"x": 1, "y": 0}
-    assert detail["missing"] == [
-        {"x": 1, "y": 2},
-        {"x": 6, "y": 1},
-        {"x": 6, "y": 2},
-    ]
-    assert detail["extra"] == []
+    assert detail["present_layers"] == [2]
+    assert detail["missing_prefix_layers"] == [1]
+
+
+def test_punch_plan_non_prefix_gap_reports_missing_layers():
+    # 给出层 1 和层 3，中间缺层 2
+    resp = client.post(
+        "/api/v1/punch-plan",
+        json={
+            "board": {"width": 8, "height": 4},
+            "folds": ["left", "down"],
+            "targets": [{"x": 1, "y": 1}, {"x": 6, "y": 2}],
+        },
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["error"] == "non_prefix_depth_group"
+    assert detail["present_layers"] == [1, 3]
+    assert detail["missing_prefix_layers"] == [2]
 
 
 def test_punch_plan_odd_axis_returns_400():
