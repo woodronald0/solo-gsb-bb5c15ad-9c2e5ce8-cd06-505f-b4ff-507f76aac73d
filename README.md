@@ -6,7 +6,7 @@
 
 返回内容：展开后的唯一孔位、每个孔位的覆盖层数，以及每个孔位的来源路径（来自哪个打孔点、该分支的最终层号、每一步折叠走了哪一侧）。
 
-另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，复算校验镜像轨道完整后，返回最小且唯一的打孔点列表。
+另提供**反向打孔规划**接口：提交期望在展开板材上出现的目标孔位，服务端沿折叠过程将目标归并到最终折叠面的等价位置，并按最终叠层自上而下把组内目标映射为层号；当每组层号恰好构成连续前缀 `1..d` 时，该组用一个限深打孔点（`depth = d`，贯穿全部层时省略 `depth`）覆盖，复算校验后返回最小且唯一的打孔点列表。
 
 ## 快速开始
 
@@ -157,11 +157,11 @@ curl -X POST http://localhost:8000/api/v1/unfold \
 
 ### `POST /api/v1/punch-plan`
 
-反向打孔规划：提交期望在**展开板材**上出现的目标孔位，服务端沿折叠过程把每个目标孔位归并到最终折叠面的等价位置（相同位置构成一个等价组），再用现有展开逻辑复算校验，返回**最小且唯一**的打孔点列表（可直接作为 `/api/v1/unfold` 的 `punches` 使用）。
+反向打孔规划：提交期望在**展开板材**上出现的目标孔位，服务端沿折叠过程把每个目标孔位归并到最终折叠面的等价位置（相同位置构成一个等价组），并按最终叠层自上而下把组内目标映射为层号；当每组层号恰好是连续前缀 `1..d` 时，该组用一个限深打孔点覆盖（`depth = d`；`d` 等于总层数 `2^折叠步数` 时省略 `depth`，即贯穿全部层）。返回的打孔点列表**最小且唯一**，可直接作为 `/api/v1/unfold` 的 `punches` 使用，复算孔位与去重后的目标完全一致。
 
 - 目标孔位自动**去重**，响应中 `punches` 按 `(x, y)` 稳定排序。
-- 仅当每个等价组都形成**完整镜像轨道**（复算结果与目标集合完全一致）时才返回 200。
-- 目标缺少对称孔或含越界坐标时返回 400，并列出首个不完整等价组的缺失/多余坐标，**不会默默补孔**。
+- 每个等价组的层号必须构成**连续前缀** `1..d`（限深打孔只能打穿前 `depth` 层）。
+- 目标跳层或缺少更上层（层号非连续前缀）、或含越界坐标时返回 400，并列出首个异常等价组的已有层号与缺失前缀层，**不会默默补孔**。
 
 **请求体**
 
@@ -202,7 +202,31 @@ curl -X POST http://localhost:8000/api/v1/unfold \
 | `final_face` / `stack_layers` | 同 `/api/v1/unfold` |
 | `target_count` | 去重后的目标孔位数 |
 | `punch_count` | 最小打孔点数（等价组数） |
-| `punches` | 最终折叠面上的打孔点（局部坐标），按 `(x, y)` 稳定排序 |
+| `punches` | 最终折叠面上的打孔点（局部坐标），按 `(x, y)` 稳定排序；对应等价组只覆盖前 `depth` 层时携带 `depth`，贯穿全部层时省略 |
+
+**限深示例**：目标只覆盖某等价组叠层的前 2 层（共 4 层）时，返回带 `depth` 的打孔点
+
+```bash
+curl -X POST http://localhost:8000/api/v1/punch-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "board": {"width": 8, "height": 4},
+    "folds": ["left", "down"],
+    "targets": [{"x": 1, "y": 1}, {"x": 6, "y": 1}]
+  }'
+```
+
+```json
+{
+  "board": { "width": 8, "height": 4 },
+  "folds": ["left", "down"],
+  "final_face": { "x": 0, "y": 2, "width": 4, "height": 2 },
+  "stack_layers": 4,
+  "target_count": 2,
+  "punch_count": 1,
+  "punches": [{ "x": 1, "y": 0, "depth": 2 }]
+}
+```
 
 **curl 示例**
 
@@ -219,18 +243,18 @@ curl -X POST http://localhost:8000/api/v1/punch-plan \
 **错误响应**
 
 - `400 target_out_of_bounds`：目标含越界坐标，`detail.out_of_bounds` 按 `(x, y)` 排序列出全部越界点。
-- `400 incomplete_equivalence_group`：目标缺少对称孔，`detail.group` 为首个不完整等价组（折叠面局部坐标，按 `(x, y)` 顺序取第一个），`detail.missing` / `detail.extra` 分别为该组缺失 / 多余的坐标（原始板材坐标）。
+- `400 non_prefix_depth_group`：目标在某个等价组的叠层中跳层或缺少更上层（层号不是连续前缀 `1..d`）。`detail.group` 为首个异常等价组（折叠面局部坐标，按 `(x, y)` 顺序取第一个），`detail.present_layers` 为该组目标已有的层号，`detail.missing_prefix_layers` 为缺失的前缀层号。
 - `400 odd_fold_axis` / `400 limit_exceeded`：同 `/api/v1/unfold`。
 - `422`：请求体不符合 schema（如空目标列表、负坐标）。
 
 ```json
 {
   "detail": {
-    "error": "incomplete_equivalence_group",
-    "message": "等价组 (1, 0) 的镜像轨道不完整：缺失 3 个、多余 0 个坐标；请补全或移除后重试，服务端不会自动补孔。",
+    "error": "non_prefix_depth_group",
+    "message": "等价组 (1, 0) 的目标层号 [2] 不是自上而下的连续前缀：缺失前缀层 [1]；限深打孔只能打穿前 depth 层，请补全缺失层对应的目标或移除跳层目标后重试，服务端不会自动补孔。",
     "group": { "x": 1, "y": 0 },
-    "missing": [{ "x": 1, "y": 2 }, { "x": 6, "y": 1 }, { "x": 6, "y": 2 }],
-    "extra": []
+    "present_layers": [2],
+    "missing_prefix_layers": [1]
   }
 }
 ```

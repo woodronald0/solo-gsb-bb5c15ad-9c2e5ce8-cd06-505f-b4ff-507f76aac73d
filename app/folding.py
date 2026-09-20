@@ -216,12 +216,16 @@ def unfold_board(
     }
 
 
-def fold_point(regions: list[Region], folds: list[str], x: int, y: int) -> tuple[int, int]:
-    """将原始板材坐标 (x, y) 沿折叠序列正向映射到最终折叠面（仍为板材坐标）。
+def fold_point_layer(
+    regions: list[Region], folds: list[str], x: int, y: int
+) -> tuple[tuple[int, int], int]:
+    """正向折叠原始板材坐标 (x, y)，返回（最终折叠面坐标, 最终叠层中的层号）。
 
-    每步折叠中，位于被移动半区的点关于折叠轴镜像，其余点保持不动；
-    与 unfold_board 的逆序镜像传播互为逆过程。
+    每步折叠中，位于被移动半区的点关于折叠轴镜像（mirror 分支），其余点
+    保持不动（stay 分支）；分支序列经 layer_number 换算为最终叠层自上而下
+    的层号（1 = 最上层），与 unfold_board 展开路径上的 layer 完全一致。
     """
+    steps: list[dict] = []
     for i, direction in enumerate(folds):
         before = regions[i]
         if direction in HORIZONTAL_FOLDS:
@@ -229,12 +233,27 @@ def fold_point(regions: list[Region], folds: list[str], x: int, y: int) -> tuple
             moved = x >= before.x + half if direction == "left" else x < before.x + half
             if moved:
                 x = 2 * before.x + before.width - 1 - x
+                steps.append({"branch": "mirror"})
+            else:
+                steps.append({"branch": "stay"})
         else:
             half = before.height // 2
             moved = y >= before.y + half if direction == "up" else y < before.y + half
             if moved:
                 y = 2 * before.y + before.height - 1 - y
-    return x, y
+                steps.append({"branch": "mirror"})
+            else:
+                steps.append({"branch": "stay"})
+    return (x, y), layer_number(steps)
+
+
+def fold_point(regions: list[Region], folds: list[str], x: int, y: int) -> tuple[int, int]:
+    """将原始板材坐标 (x, y) 沿折叠序列正向映射到最终折叠面（仍为板材坐标）。
+
+    每步折叠中，位于被移动半区的点关于折叠轴镜像，其余点保持不动；
+    与 unfold_board 的逆序镜像传播互为逆过程。
+    """
+    return fold_point_layer(regions, folds, x, y)[0]
 
 
 def plan_punches(
@@ -246,25 +265,29 @@ def plan_punches(
     max_punches: int | None = None,
     max_total_holes: int | None = None,
 ) -> dict:
-    """反向打孔规划：由期望的展开孔位反推最终折叠面上的最小打孔点集合。
+    """反向打孔规划：由期望的展开孔位反推最终折叠面上的（限深）打孔点集合。
 
     流程：
     1. 目标孔位去重并做板材边界校验；
-    2. 沿折叠序列把每个目标孔位正向归并到最终折叠面的等价位置，
-       相同位置构成一个等价组，组代表即候选打孔点；
-    3. 复用 unfold_board 对候选打孔点复算展开结果；
-    4. 仅当每个等价组都形成完整镜像轨道（复算集合与目标集合完全一致）
-       时，返回按 (x, y) 稳定排序的最小打孔点列表。
+    2. 沿折叠序列把每个目标孔位正向归并到最终折叠面的等价位置（相同位置
+       构成一个等价组，组代表即候选打孔点），同时算出它在该组最终叠层中
+       的层号（自上而下，1 = 最上层）；
+    3. 每个等价组的层号集合必须恰好是连续前缀 1..d：该组用一个限深打孔点
+       覆盖（depth=d），d 等于总层数 2^len(folds) 时省略 depth（贯穿全部层）；
+    4. 复用 unfold_board 按推导出的 depth 复算展开结果，仅当复算孔位集合
+       与去重后的目标集合完全一致时，返回按 (x, y) 稳定排序的打孔点列表。
 
     异常：
         FoldError("target_out_of_bounds")：目标含越界坐标，
             context 的 out_of_bounds 列出全部越界点。
-        FoldError("incomplete_equivalence_group")：首个不完整等价组，
-            context 列出该组缺失 / 多余坐标，绝不默默补孔。
+        FoldError("non_prefix_depth_group")：首个层号非连续前缀的等价组
+            （目标跳层或缺少更上层），context 列出该组的 present_layers 与
+            missing_prefix_layers，绝不默默补孔。
         FoldError("limit_exceeded")：归并后的打孔点数或展开孔位总数超限。
     """
     regions = fold_regions(width, height, folds)
     final = regions[-1]
+    total_layers = 1 << len(folds)
 
     # 目标孔位去重，统一按 (x, y) 排序保证后续处理顺序稳定
     unique_targets = sorted(set(targets))
@@ -282,16 +305,12 @@ def plan_punches(
             board_height=height,
         )
 
-    def to_local(x: int, y: int) -> tuple[int, int]:
-        """板材坐标 -> 最终折叠面局部坐标。"""
-        fx, fy = fold_point(regions, folds, x, y)
-        return fx - final.x, fy - final.y
-
-    # 沿折叠过程归并：等价组（折叠面局部坐标）-> 组内目标孔位
-    members_by_punch: dict[tuple[int, int], set[tuple[int, int]]] = {}
-    for target in unique_targets:
-        members_by_punch.setdefault(to_local(*target), set()).add(target)
-    punches = sorted(members_by_punch)
+    # 沿折叠过程正向归并：等价组（折叠面局部坐标）-> 组内目标占有的层号集合
+    layers_by_punch: dict[tuple[int, int], set[int]] = {}
+    for tx, ty in unique_targets:
+        (fx, fy), layer = fold_point_layer(regions, folds, tx, ty)
+        layers_by_punch.setdefault((fx - final.x, fy - final.y), set()).add(layer)
+    punches = sorted(layers_by_punch)
 
     if max_punches is not None and len(punches) > max_punches:
         raise FoldError(
@@ -307,32 +326,31 @@ def plan_punches(
                 f"MAX_TOTAL_HOLES={max_total_holes}，请减少折叠步数或目标孔位。",
             )
 
-    # 用现有展开逻辑复算，并把复算孔位归并回各自等价组（即完整镜像轨道）
-    recomputed = unfold_board(width, height, folds, punches)
-    orbit_by_punch: dict[tuple[int, int], set[tuple[int, int]]] = {
-        punch: set() for punch in punches
-    }
-    for hole in recomputed["holes"]:
-        orbit_by_punch[to_local(hole["x"], hole["y"])].add((hole["x"], hole["y"]))
-
-    # 按 (x, y) 顺序找到首个不完整等价组，列出缺失 / 多余坐标
+    # 逐组校验层号为连续前缀 1..d，并推导限深（d 等于总层数时省略 depth）
+    depths: list[int | None] = []
     for punch in punches:
-        orbit = orbit_by_punch[punch]
-        members = members_by_punch[punch]
-        missing = sorted(orbit - members)  # 轨道中未被目标覆盖的对称孔
-        extra = sorted(members - orbit)    # 目标中不属于该轨道的孔（结构性为空，防御保留）
-        if missing or extra:
+        present = sorted(layers_by_punch[punch])
+        d = len(present)
+        if present != list(range(1, d + 1)):
+            missing = [
+                layer
+                for layer in range(1, present[-1] + 1)
+                if layer not in layers_by_punch[punch]
+            ]
             raise FoldError(
-                "incomplete_equivalence_group",
-                f"等价组 ({punch[0]}, {punch[1]}) 的镜像轨道不完整："
-                f"缺失 {len(missing)} 个、多余 {len(extra)} 个坐标；"
-                "请补全或移除后重试，服务端不会自动补孔。",
+                "non_prefix_depth_group",
+                f"等价组 ({punch[0]}, {punch[1]}) 的目标层号 {present} 不是"
+                f"自上而下的连续前缀：缺失前缀层 {missing}；限深打孔只能打穿"
+                "前 depth 层，请补全缺失层对应的目标或移除跳层目标后重试，"
+                "服务端不会自动补孔。",
                 group={"x": punch[0], "y": punch[1]},
-                missing=[{"x": x, "y": y} for x, y in missing],
-                extra=[{"x": x, "y": y} for x, y in extra],
+                present_layers=present,
+                missing_prefix_layers=missing,
             )
+        depths.append(None if d == total_layers else d)
 
-    # 组完整性已保证复算集合与目标集合一致，此处为防御性校验
+    # 用现有展开逻辑按推导出的 depth 复算，验证复算孔位与目标集合完全一致
+    recomputed = unfold_board(width, height, folds, punches, depths)
     target_set = set(unique_targets)
     recomputed_set = {(h["x"], h["y"]) for h in recomputed["holes"]}
     if recomputed_set != target_set:
@@ -350,8 +368,11 @@ def plan_punches(
             "width": final.width,
             "height": final.height,
         },
-        "stack_layers": 1 << len(folds),
+        "stack_layers": total_layers,
         "target_count": len(unique_targets),
         "punch_count": len(punches),
-        "punches": [{"x": x, "y": y} for x, y in punches],
+        "punches": [
+            {"x": x, "y": y, **({"depth": d} if d is not None else {})}
+            for (x, y), d in zip(punches, depths)
+        ],
     }
